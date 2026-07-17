@@ -21,6 +21,7 @@ type memDB struct {
 	countVal     int64
 	lastInsertID int64
 	rowsAffected int64
+	execErr      error
 	queries      []recorded
 }
 
@@ -39,6 +40,7 @@ func (m *memDB) reset() {
 	m.countVal = 0
 	m.lastInsertID = 0
 	m.rowsAffected = 0
+	m.execErr = nil
 	m.queries = nil
 }
 
@@ -85,7 +87,11 @@ func (memConn) QueryContext(_ context.Context, query string, args []driver.Named
 	mem.record(query, vs)
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
-	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT COUNT") {
+	// A plain scalar COUNT(*) query returns the preset countVal. Aggregate and
+	// grouped queries (which alias their columns with " AS ") fall through to the
+	// preset cols/rows so multi-column results can be scanned.
+	up := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(up, "SELECT COUNT(*) FROM") && !strings.Contains(up, " AS ") {
 		return &memRows{cols: []string{"count"}, rows: [][]driver.Value{{mem.countVal}}}, nil
 	}
 	return &memRows{cols: append([]string(nil), mem.cols...), rows: cloneRows(mem.rows)}, nil
@@ -96,6 +102,9 @@ func (memConn) ExecContext(_ context.Context, query string, args []driver.NamedV
 	mem.record(query, vs)
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
+	if mem.execErr != nil {
+		return nil, mem.execErr
+	}
 	return memResult{lastID: mem.lastInsertID, affected: mem.rowsAffected}, nil
 }
 

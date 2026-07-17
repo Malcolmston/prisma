@@ -17,9 +17,30 @@ const (
 	Desc Direction = "DESC"
 )
 
+// Nulls controls where NULL values sort relative to non-NULL values in an
+// ORDER BY term.
+type Nulls int
+
+const (
+	// NullsDefault leaves NULL ordering to the engine's default.
+	NullsDefault Nulls = iota
+	// NullsFirst sorts NULL values before non-NULL values.
+	NullsFirst
+	// NullsLast sorts NULL values after non-NULL values.
+	NullsLast
+)
+
 type orderBy struct {
 	column string
 	dir    Direction
+	nulls  Nulls
+}
+
+// cursor is a keyset pagination anchor: rows strictly after value in the
+// column's sort direction are returned.
+type cursor struct {
+	column string
+	value  any
 }
 
 // scanTarget describes where a selected column's value should be scanned.
@@ -34,6 +55,7 @@ type scanTarget struct {
 // return the generated SQL and arguments without executing.
 type Query[T any] struct {
 	client   *Client
+	conn     execer
 	model    *Model
 	conds    []Condition
 	orders   []orderBy
@@ -41,7 +63,17 @@ type Query[T any] struct {
 	take     *int
 	skip     *int
 	includes []*Field
+	distinct []string
+	distAll  bool
+	cur      *cursor
+	skipDups bool
 	err      error
+}
+
+// newWriter builds an sqlWriter seeded with the query's dialect, registry and
+// base model so relation-filter and JSON conditions can resolve at compile time.
+func (q *Query[T]) newWriter() *sqlWriter {
+	return &sqlWriter{d: q.client.dialect, reg: q.client.registry, base: q.model}
 }
 
 // Where appends conditions, combined with the existing predicate using AND.
@@ -50,9 +82,48 @@ func (q *Query[T]) Where(conds ...Condition) *Query[T] {
 	return q
 }
 
-// OrderBy adds an ORDER BY term.
+// OrderBy adds an ORDER BY term. Multiple calls accumulate, producing a
+// multi-column ordering in call order.
 func (q *Query[T]) OrderBy(column string, dir Direction) *Query[T] {
-	q.orders = append(q.orders, orderBy{column, dir})
+	q.orders = append(q.orders, orderBy{column: column, dir: dir})
+	return q
+}
+
+// OrderByNulls adds an ORDER BY term with explicit NULL placement. On engines
+// without native NULLS syntax (see [Dialect.NativeNulls]) the placement is
+// emulated with a leading "column IS NULL" sort term.
+func (q *Query[T]) OrderByNulls(column string, dir Direction, nulls Nulls) *Query[T] {
+	q.orders = append(q.orders, orderBy{column: column, dir: dir, nulls: nulls})
+	return q
+}
+
+// Distinct restricts the result to distinct rows. With no columns it emits a
+// plain SELECT DISTINCT; with columns on a dialect that supports it (see
+// [Dialect.DistinctOn]) it emits SELECT DISTINCT ON (columns), otherwise it
+// falls back to SELECT DISTINCT.
+func (q *Query[T]) Distinct(columns ...string) *Query[T] {
+	if len(columns) == 0 {
+		q.distAll = true
+	}
+	q.distinct = append(q.distinct, columns...)
+	return q
+}
+
+// Cursor sets a keyset pagination anchor: only rows strictly after value in the
+// sort direction of column are returned. The column should also appear in an
+// [Query.OrderBy] term; its direction determines whether the anchor uses "&gt;"
+// (Asc) or "&lt;" (Desc). Combine with [Query.Skip] and [Query.Take] for
+// forward pagination.
+func (q *Query[T]) Cursor(column string, value any) *Query[T] {
+	q.cur = &cursor{column: column, value: value}
+	return q
+}
+
+// SkipDuplicates makes the next [Query.CreateMany] ignore rows that violate a
+// unique constraint instead of failing (ON CONFLICT DO NOTHING / INSERT IGNORE,
+// per the dialect's [Dialect.Upsert] style).
+func (q *Query[T]) SkipDuplicates() *Query[T] {
+	q.skipDups = true
 	return q
 }
 
@@ -87,13 +158,38 @@ func (q *Query[T]) Include(relation string) *Query[T] {
 	return q
 }
 
-// whereClause compiles the accumulated conditions into a " WHERE ..." fragment.
+// cursorCondition returns the keyset predicate implied by the cursor, or nil.
+// The comparison direction follows the matching OrderBy term (Asc => ">",
+// Desc => "<"); absent an explicit order it defaults to ascending.
+func (q *Query[T]) cursorCondition() Condition {
+	if q.cur == nil {
+		return nil
+	}
+	dir := Asc
+	for _, o := range q.orders {
+		if o.column == q.cur.column {
+			dir = o.dir
+			break
+		}
+	}
+	if dir == Desc {
+		return Lt(q.cur.column, q.cur.value)
+	}
+	return Gt(q.cur.column, q.cur.value)
+}
+
+// whereClause compiles the accumulated conditions (plus any cursor predicate)
+// into a " WHERE ..." fragment.
 func (q *Query[T]) whereClause(w *sqlWriter) string {
-	if len(q.conds) == 0 {
+	conds := q.conds
+	if cc := q.cursorCondition(); cc != nil {
+		conds = append(append([]Condition(nil), conds...), cc)
+	}
+	if len(conds) == 0 {
 		return ""
 	}
-	parts := make([]string, 0, len(q.conds))
-	for _, c := range q.conds {
+	parts := make([]string, 0, len(conds))
+	for _, c := range conds {
 		s := c.compile(w)
 		if s != "" {
 			parts = append(parts, s)
@@ -103,6 +199,43 @@ func (q *Query[T]) whereClause(w *sqlWriter) string {
 		return ""
 	}
 	return " WHERE " + strings.Join(parts, " AND ")
+}
+
+// orderClause renders the ORDER BY fragment, qualifying base columns when the
+// query joins and emulating NULLS placement on engines that lack native syntax.
+func (q *Query[T]) orderClause(joined bool) string {
+	if len(q.orders) == 0 {
+		return ""
+	}
+	base := q.model.Table
+	var terms []string
+	for _, o := range q.orders {
+		col := o.column
+		if joined {
+			if _, ok := q.model.FieldByColumn(col); ok {
+				col = base + "." + col
+			}
+		}
+		if o.nulls != NullsDefault && !q.client.dialect.NativeNulls {
+			// Emulate: a boolean "col IS NULL" sorts NULLs (1) after non-NULLs
+			// (0) ascending. NullsFirst wants them first, so sort that key DESC.
+			nullDir := "ASC"
+			if o.nulls == NullsFirst {
+				nullDir = "DESC"
+			}
+			terms = append(terms, "("+col+" IS NULL) "+nullDir)
+		}
+		term := col + " " + string(o.dir)
+		if o.nulls != NullsDefault && q.client.dialect.NativeNulls {
+			if o.nulls == NullsFirst {
+				term += " NULLS FIRST"
+			} else {
+				term += " NULLS LAST"
+			}
+		}
+		terms = append(terms, term)
+	}
+	return " ORDER BY " + strings.Join(terms, ", ")
 }
 
 // relTargetModel resolves the compiled model for a relation field.
@@ -165,6 +298,7 @@ func (q *Query[T]) buildSelect(w *sqlWriter) (string, []scanTarget, error) {
 
 	var b strings.Builder
 	b.WriteString("SELECT ")
+	b.WriteString(q.distinctPrefix(joined))
 	b.WriteString(strings.Join(cols, ", "))
 	b.WriteString(" FROM ")
 	b.WriteString(base)
@@ -173,21 +307,10 @@ func (q *Query[T]) buildSelect(w *sqlWriter) (string, []scanTarget, error) {
 		b.WriteString(j)
 	}
 	b.WriteString(q.whereClause(w))
-
-	if len(q.orders) > 0 {
-		terms := make([]string, len(q.orders))
-		for i, o := range q.orders {
-			col := o.column
-			if joined {
-				if _, ok := q.model.FieldByColumn(col); ok {
-					col = base + "." + col
-				}
-			}
-			terms[i] = col + " " + string(o.dir)
-		}
-		b.WriteString(" ORDER BY ")
-		b.WriteString(strings.Join(terms, ", "))
+	if w.err != nil {
+		return "", nil, w.err
 	}
+	b.WriteString(q.orderClause(joined))
 	if q.take != nil {
 		b.WriteString(" LIMIT " + w.bind(*q.take))
 	}
@@ -197,9 +320,30 @@ func (q *Query[T]) buildSelect(w *sqlWriter) (string, []scanTarget, error) {
 	return b.String(), plan, nil
 }
 
+// distinctPrefix renders the "DISTINCT" / "DISTINCT ON (...) " prefix that
+// follows the SELECT keyword, or "" when the query is not distinct.
+func (q *Query[T]) distinctPrefix(joined bool) string {
+	if !q.distAll && len(q.distinct) == 0 {
+		return ""
+	}
+	if len(q.distinct) > 0 && q.client.dialect.DistinctOn {
+		cols := make([]string, len(q.distinct))
+		for i, c := range q.distinct {
+			if joined {
+				if _, ok := q.model.FieldByColumn(c); ok {
+					c = q.model.Table + "." + c
+				}
+			}
+			cols[i] = c
+		}
+		return "DISTINCT ON (" + strings.Join(cols, ", ") + ") "
+	}
+	return "DISTINCT "
+}
+
 // FindManySQL returns the SELECT statement and bound arguments for FindMany.
 func (q *Query[T]) FindManySQL() (string, []any, error) {
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	sqlStr, _, err := q.buildSelect(w)
 	return sqlStr, w.args, err
 }
@@ -209,11 +353,14 @@ func (q *Query[T]) CountSQL() (string, []any, error) {
 	if q.err != nil {
 		return "", nil, q.err
 	}
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	var b strings.Builder
 	b.WriteString("SELECT COUNT(*) FROM ")
 	b.WriteString(q.model.Table)
 	b.WriteString(q.whereClause(w))
+	if w.err != nil {
+		return "", nil, w.err
+	}
 	return b.String(), w.args, nil
 }
 
@@ -222,11 +369,14 @@ func (q *Query[T]) DeleteSQL() (string, []any, error) {
 	if q.err != nil {
 		return "", nil, q.err
 	}
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	var b strings.Builder
 	b.WriteString("DELETE FROM ")
 	b.WriteString(q.model.Table)
 	b.WriteString(q.whereClause(w))
+	if w.err != nil {
+		return "", nil, w.err
+	}
 	return b.String(), w.args, nil
 }
 
@@ -248,7 +398,7 @@ func (q *Query[T]) UpdateSQL(data map[string]any) (string, []any, error) {
 	}
 	sort.Strings(cols)
 
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	var b strings.Builder
 	b.WriteString("UPDATE ")
 	b.WriteString(q.model.Table)
@@ -259,6 +409,9 @@ func (q *Query[T]) UpdateSQL(data map[string]any) (string, []any, error) {
 	}
 	b.WriteString(strings.Join(sets, ", "))
 	b.WriteString(q.whereClause(w))
+	if w.err != nil {
+		return "", nil, w.err
+	}
 	return b.String(), w.args, nil
 }
 
@@ -290,7 +443,7 @@ func (q *Query[T]) CreateSQL(value T) (string, []any, error) {
 	if len(fields) == 0 {
 		return "", nil, fmt.Errorf("prisma: nothing to insert for %s", q.model.Name)
 	}
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	cols := make([]string, len(fields))
 	marks := make([]string, len(fields))
 	for i, f := range fields {
@@ -310,7 +463,7 @@ func (q *Query[T]) CreateManySQL(values []T) (string, []any, error) {
 	if len(values) == 0 {
 		return "", nil, fmt.Errorf("prisma: CreateMany requires at least one row")
 	}
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	var cols []string
 	tuples := make([]string, len(values))
 	for i, v := range values {
@@ -327,7 +480,15 @@ func (q *Query[T]) CreateManySQL(values []T) (string, []any, error) {
 		}
 		tuples[i] = "(" + strings.Join(marks, ", ") + ")"
 	}
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-		q.model.Table, strings.Join(cols, ", "), strings.Join(tuples, ", "))
-	return sqlStr, w.args, nil
+	verb := "INSERT INTO"
+	if q.skipDups && q.client.dialect.Upsert == OnDuplicateKey {
+		verb = "INSERT IGNORE INTO"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s (%s) VALUES %s",
+		verb, q.model.Table, strings.Join(cols, ", "), strings.Join(tuples, ", "))
+	if q.skipDups && q.client.dialect.Upsert == OnConflict {
+		b.WriteString(" ON CONFLICT DO NOTHING")
+	}
+	return b.String(), w.args, nil
 }

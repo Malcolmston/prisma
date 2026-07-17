@@ -67,7 +67,25 @@
 //
 // The available terminal operations are [Query.FindMany], [Query.FindFirst],
 // [Query.FindUnique], [Query.Count], [Query.Create], [Query.CreateMany],
-// [Query.Update] and [Query.Delete].
+// [Query.Update], [Query.Delete] and [Query.Upsert].
+//
+// # Beyond basic CRUD
+//
+// The builder also supports:
+//
+//   - Aggregations via [Query.Aggregate] and grouped aggregation via
+//     [Query.GroupBy] (with HAVING).
+//   - Relation filters [Some], [Every], [None] and [Is], compiling to
+//     correlated EXISTS subqueries that compose inside [And]/[Or].
+//   - [Query.Distinct], keyset [Query.Cursor] pagination and NULLS-aware
+//     [Query.OrderByNulls] ordering.
+//   - Nested writes through [Query.NestedCreate] (create / connect /
+//     connectOrCreate / update on to-many relations).
+//   - Interactive and batched transactions via [Client.Transaction] and
+//     [Client.Batch], with queries started by [NewTxQuery].
+//   - Raw SQL via [Client.QueryRaw], [QueryRawInto] and [Client.ExecuteRaw].
+//   - JSON path filters [JSONPath] / [JSONEquals].
+//   - Typed error codes ([Error]) such as P2002 (unique) and P2025 (not found).
 //
 // # Execution
 //

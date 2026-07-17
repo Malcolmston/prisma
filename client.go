@@ -8,8 +8,17 @@ import (
 	"reflect"
 )
 
-// ErrNotFound is returned by FindUnique and FindFirst when no row matches.
+// ErrNotFound is returned by FindUnique and FindFirst when no row matches. It
+// wraps the P2025 "record not found" code (see [Error]).
 var ErrNotFound = errors.New("prisma: record not found")
+
+// execer is the subset of *sql.DB and *sql.Tx used to run queries, letting the
+// same builder execute against either a connection pool or a transaction.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
 
 // Client is the entry point for building and executing queries. It bundles a
 // *sql.DB, a model Registry and a Dialect. A Client with a nil DB can still
@@ -60,9 +69,22 @@ func (c *Client) Register(v any) (*Model, error) {
 // the client it is registered lazily; any registration error is deferred and
 // surfaced by the terminal method.
 func NewQuery[T any](c *Client) *Query[T] {
+	return newQuery[T](c, c.db)
+}
+
+// NewTxQuery starts a new query for model T that executes against the
+// transaction tx instead of the client's connection pool. It is otherwise
+// identical to [NewQuery].
+func NewTxQuery[T any](tx *Tx) *Query[T] {
+	return newQuery[T](tx.client, tx.tx)
+}
+
+// newQuery is the shared constructor behind NewQuery and NewTxQuery; conn is the
+// executor (a *sql.DB or *sql.Tx) that terminal methods run against.
+func newQuery[T any](c *Client, conn execer) *Query[T] {
 	var zero T
 	t := reflect.TypeOf(zero)
-	q := &Query[T]{client: c}
+	q := &Query[T]{client: c, conn: conn}
 	if t == nil {
 		q.err = fmt.Errorf("prisma: NewQuery[T] requires a concrete struct type")
 		return q
@@ -81,19 +103,43 @@ func NewQuery[T any](c *Client) *Query[T] {
 	return q
 }
 
+// executor returns the connection the query runs against, or an error if none
+// was configured (a client built with a nil *sql.DB).
+func (q *Query[T]) executor() (execer, error) {
+	if isNilExecer(q.conn) {
+		return nil, fmt.Errorf("prisma: no *sql.DB configured")
+	}
+	return q.conn, nil
+}
+
+// isNilExecer reports whether an execer interface is nil or holds a nil pointer.
+func isNilExecer(e execer) bool {
+	if e == nil {
+		return true
+	}
+	if db, ok := e.(*sql.DB); ok {
+		return db == nil
+	}
+	if tx, ok := e.(*sql.Tx); ok {
+		return tx == nil
+	}
+	return false
+}
+
 // FindMany executes the SELECT and scans every row into a slice of T.
 func (q *Query[T]) FindMany(ctx context.Context) ([]T, error) {
-	w := &sqlWriter{d: q.client.dialect}
+	w := q.newWriter()
 	sqlStr, plan, err := q.buildSelect(w)
 	if err != nil {
 		return nil, err
 	}
-	if q.client.db == nil {
-		return nil, fmt.Errorf("prisma: no *sql.DB configured")
-	}
-	rows, err := q.client.db.QueryContext(ctx, sqlStr, w.args...)
+	conn, err := q.executor()
 	if err != nil {
 		return nil, err
+	}
+	rows, err := conn.QueryContext(ctx, sqlStr, w.args...)
+	if err != nil {
+		return nil, mapError(err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -139,12 +185,15 @@ func (q *Query[T]) Count(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if q.client.db == nil {
-		return 0, fmt.Errorf("prisma: no *sql.DB configured")
+	conn, err := q.executor()
+	if err != nil {
+		return 0, err
 	}
 	var n int64
-	err = q.client.db.QueryRowContext(ctx, sqlStr, args...).Scan(&n)
-	return n, err
+	if err := conn.QueryRowContext(ctx, sqlStr, args...).Scan(&n); err != nil {
+		return 0, mapError(err)
+	}
+	return n, nil
 }
 
 // Create inserts a single row. If the model's primary key is auto-generated and
@@ -154,12 +203,13 @@ func (q *Query[T]) Create(ctx context.Context, value T) (T, error) {
 	if err != nil {
 		return value, err
 	}
-	if q.client.db == nil {
-		return value, fmt.Errorf("prisma: no *sql.DB configured")
-	}
-	res, err := q.client.db.ExecContext(ctx, sqlStr, args...)
+	conn, err := q.executor()
 	if err != nil {
 		return value, err
+	}
+	res, err := conn.ExecContext(ctx, sqlStr, args...)
+	if err != nil {
+		return value, mapError(err)
 	}
 	if pk := q.model.PK; pk != nil && pk.IsAuto {
 		if id, lerr := res.LastInsertId(); lerr == nil && id != 0 {
@@ -203,14 +253,27 @@ func (q *Query[T]) Delete(ctx context.Context) (int64, error) {
 }
 
 func (q *Query[T]) exec(ctx context.Context, sqlStr string, args []any) (int64, error) {
-	if q.client.db == nil {
-		return 0, fmt.Errorf("prisma: no *sql.DB configured")
-	}
-	res, err := q.client.db.ExecContext(ctx, sqlStr, args...)
+	conn, err := q.executor()
 	if err != nil {
 		return 0, err
 	}
+	res, err := conn.ExecContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, mapError(err)
+	}
 	return res.RowsAffected()
+}
+
+// UpdateMany is an alias for [Query.Update] using Prisma's method name: it
+// applies data to every matching row and returns the number affected.
+func (q *Query[T]) UpdateMany(ctx context.Context, data map[string]any) (int64, error) {
+	return q.Update(ctx, data)
+}
+
+// DeleteMany is an alias for [Query.Delete] using Prisma's method name: it
+// removes every matching row and returns the number affected.
+func (q *Query[T]) DeleteMany(ctx context.Context) (int64, error) {
+	return q.Delete(ctx)
 }
 
 // scanDest builds the slice of scan destinations for one record following the

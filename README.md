@@ -10,6 +10,11 @@ top of `database/sql`.
   arguments, never concatenated into the SQL string.
 - Execute against any `*sql.DB` driver and scan rows back into structs, or grab
   the generated `(sql, args)` and run them yourself.
+- **Aggregations & GroupBy** (`_count`/`_sum`/`_avg`/`_min`/`_max` + `HAVING`),
+  **relation filters** (`Some`/`Every`/`None`/`Is`), **nested writes**
+  (create/connect/connectOrCreate/update), **transactions** (interactive +
+  batch), **raw queries**, **upsert**, **cursor pagination**, **distinct**,
+  **JSON path filters**, and **typed error codes** (P2002, P2025, …).
 
 ## Install
 
@@ -121,10 +126,124 @@ method.
 `Equals`, `Not`, `In`, `NotIn`, `Lt`, `Lte`, `Gt`, `Gte`, `Contains`,
 `StartsWith`, `EndsWith`, combined with `And`, `Or` and `NotGroup`.
 
+## Relation filters
+
+Filter a model by its relations with correlated `EXISTS` subqueries — `Some`,
+`Every`, `None` (to-many) and `Is` (to-one). They compose inside `And`/`Or` and
+can be nested through further relations:
+
+```go
+// Users with at least one post titled "Hello".
+prisma.NewQuery[User](client).
+	Where(prisma.Some("Posts", prisma.Equals("title", "Hello"))).
+	FindMany(ctx)
+```
+
+## Aggregations & GroupBy
+
+```go
+agg, _ := prisma.NewQuery[Order](client).
+	Where(prisma.Equals("status", "paid")).
+	Aggregate().Count().Sum("amount").Avg("amount").
+	Exec(ctx)
+// agg.Count, agg.Sum["amount"], agg.Avg["amount"]
+
+rows, _ := prisma.NewQuery[Order](client).
+	GroupBy("status").Count().Sum("amount").
+	Having(prisma.Gt("_count", 1)).
+	Exec(ctx) // []map[string]any keyed by column/alias
+```
+
+## Distinct, cursor pagination & NULLS ordering
+
+```go
+prisma.NewQuery[User](client).
+	OrderBy("id", prisma.Asc).
+	Cursor("id", lastID).                    // keyset pagination
+	OrderByNulls("name", prisma.Asc, prisma.NullsLast).
+	Distinct("email").
+	Take(20).Skip(0).
+	FindMany(ctx)
+```
+
+## Nested writes
+
+Insert a parent together with dependent relation writes in one transaction; the
+parent's generated key is threaded into each child:
+
+```go
+prisma.NewQuery[User](client).
+	NestedCreate(User{Name: "Ada"}).
+	Create("Posts", Post{Title: "Hello"}).
+	Connect("Posts", prisma.Equals("id", 7)).
+	ConnectOrCreate("Posts", []prisma.Condition{prisma.Equals("id", 9)}, Post{Title: "Draft"}).
+	Exec(ctx)
+```
+
+## Transactions
+
+```go
+// Interactive: read, decide, write — all-or-nothing.
+client.Transaction(ctx, func(tx *prisma.Tx) error {
+	_, err := prisma.NewTxQuery[Account](tx).
+		Where(prisma.Equals("id", 1)).
+		Update(ctx, map[string]any{"balance": 900})
+	return err
+})
+
+// Batch: a list of writes that commit or roll back together.
+client.Batch(ctx,
+	func(ctx context.Context, tx *prisma.Tx) (int64, error) { /* ... */ },
+)
+```
+
+## Upsert, createMany & counts
+
+```go
+prisma.NewQuery[User](client).Upsert(ctx,
+	[]string{"email"},
+	User{Name: "Ada", Email: "ada@x.com"},
+	map[string]any{"name": "Ada Lovelace"})
+
+prisma.NewQuery[User](client).SkipDuplicates().CreateMany(ctx, users)
+prisma.NewQuery[User](client).Where(prisma.Gt("id", 1)).UpdateMany(ctx, data)
+prisma.NewQuery[User](client).Where(prisma.Lt("id", 9)).DeleteMany(ctx)
+```
+
+## Raw queries
+
+```go
+rows, _ := client.QueryRaw(ctx, "SELECT id, name FROM users WHERE id > ?", 0)
+users, _ := prisma.QueryRawInto[User](ctx, client, "SELECT * FROM users")
+n, _ := client.ExecuteRaw(ctx, "DELETE FROM logs WHERE ts < ?", cutoff)
+```
+
+## JSON path filters
+
+```go
+prisma.NewQuery[User](client).
+	Where(prisma.JSONEquals("data", []string{"address", "city"}, "Paris")).
+	FindMany(ctx)
+```
+
+## Typed errors
+
+Execution errors are mapped to Prisma-style codes so you can branch without
+parsing vendor strings:
+
+```go
+if errors.Is(err, prisma.ErrUniqueViolation) { /* P2002 */ }
+
+var pe *prisma.Error
+if errors.As(err, &pe) && pe.Code == prisma.CodeRecordNotFound { /* P2025 */ }
+```
+
 ## Dialects
 
-`prisma.Question` (`?`, the default — MySQL/SQLite) and `prisma.Dollar`
-(`$1, $2, …` — PostgreSQL). Select one with
+`prisma.Question` (`?`, the default — SQLite), `prisma.Dollar`
+(`$1, $2, …` — PostgreSQL, with `DISTINCT ON`, native `NULLS` ordering and
+`#>>` JSON), and `prisma.MySQLDialect` (`?` with `ON DUPLICATE KEY UPDATE` /
+`INSERT IGNORE`). Select one with
 `prisma.NewClient(db, prisma.WithDialect(prisma.Dollar))`.
 
 ## License
