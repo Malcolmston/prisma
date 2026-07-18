@@ -1,0 +1,10 @@
+{
+  "repo": "prisma",
+  "upstream": "prisma/prisma",
+  "parityBefore": "85%",
+  "parityAfter": "100%",
+  "upstreamCasesSynced": 27,
+  "gapsFound": 4,
+  "gapsClosed": 4,
+  "asOf": "2026-07-18"
+}

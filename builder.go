@@ -348,6 +348,58 @@ func (q *Query[T]) FindManySQL() (string, []any, error) {
 	return sqlStr, w.args, err
 }
 
+// dedupeDistinct collapses rows so [Query.FindMany] honours Prisma's per-field
+// `distinct` semantics on every driver. PostgreSQL deduplicates in SQL via
+// DISTINCT ON, but on engines without it the emitted SELECT DISTINCT spans
+// every projected column and so never collapses rows that differ only in an
+// unselected field (typically an auto primary key) — meaning distinct on a
+// subset of columns would otherwise be a no-op. Re-applying the same key-based
+// dedup in Go makes distinct:["firstName"] return one row per firstName
+// regardless of dialect. The first row of each distinct key is kept, so this
+// composes with OrderBy. With no explicit columns (Distinct() / distAll) the
+// whole projected row forms the key. Repeated columns (e.g.
+// Distinct("firstName", "firstName")) collapse to the same key as a single one.
+func (q *Query[T]) dedupeDistinct(rows []T) []T {
+	if len(rows) < 2 {
+		return rows
+	}
+	cols := q.distinct
+	if len(cols) == 0 { // distAll: key on the full projected row
+		cols = make([]string, 0, len(q.model.Fields))
+		for _, f := range q.model.Fields {
+			cols = append(cols, f.Column)
+		}
+	}
+	fields := make([]*Field, 0, len(cols))
+	for _, c := range cols {
+		if f, ok := q.model.FieldByColumn(c); ok {
+			fields = append(fields, f)
+		}
+	}
+	if len(fields) == 0 {
+		return rows
+	}
+	seen := make(map[string]struct{}, len(rows))
+	out := make([]T, 0, len(rows))
+	for _, r := range rows {
+		rv := reflect.ValueOf(r)
+		for rv.Kind() == reflect.Pointer {
+			rv = rv.Elem()
+		}
+		var key strings.Builder
+		for _, f := range fields {
+			fmt.Fprintf(&key, "%v\x00", rv.FieldByIndex(f.Index).Interface())
+		}
+		k := key.String()
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, r)
+	}
+	return out
+}
+
 // CountSQL returns the COUNT(*) statement and bound arguments.
 func (q *Query[T]) CountSQL() (string, []any, error) {
 	if q.err != nil {
@@ -355,6 +407,27 @@ func (q *Query[T]) CountSQL() (string, []any, error) {
 	}
 	w := q.newWriter()
 	var b strings.Builder
+	if q.take != nil || q.skip != nil {
+		// Prisma applies take/skip (LIMIT/OFFSET) to the set being counted, so
+		// count({ take: 2 }) over three matches returns 2, not 3. Emulate that
+		// by counting the rows of a limited subquery rather than the whole
+		// table. Plain counts (no take/skip) keep the flat "SELECT COUNT(*)
+		// FROM table" form.
+		b.WriteString("SELECT COUNT(*) FROM (SELECT 1 FROM ")
+		b.WriteString(q.model.Table)
+		b.WriteString(q.whereClause(w))
+		if q.take != nil {
+			b.WriteString(" LIMIT " + w.bind(*q.take))
+		}
+		if q.skip != nil {
+			b.WriteString(" OFFSET " + w.bind(*q.skip))
+		}
+		b.WriteString(") AS _count_sub")
+		if w.err != nil {
+			return "", nil, w.err
+		}
+		return b.String(), w.args, nil
+	}
 	b.WriteString("SELECT COUNT(*) FROM ")
 	b.WriteString(q.model.Table)
 	b.WriteString(q.whereClause(w))

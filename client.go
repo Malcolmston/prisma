@@ -155,6 +155,9 @@ func (q *Query[T]) FindMany(ctx context.Context) ([]T, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if q.distAll || len(q.distinct) > 0 {
+		out = q.dedupeDistinct(out)
+	}
 	return out, nil
 }
 
