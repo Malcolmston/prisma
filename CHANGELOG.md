@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 semantic versioning.
 
+## [0.3.0] - 2026-07-18
+
+Feature release continuing toward Prisma parity. Still pure Go standard library
+— no third-party dependencies, no cgo.
+
+### Added
+
+- **Scalar filter operators** (`filter_ext.go`): `IsNull` / `IsNotNull`
+  (`equals: null`), `Between` / `NotBetween`, negated string matches
+  `NotContains` / `NotStartsWith` / `NotEndsWith`, ASCII case-insensitive
+  matches `IEquals` / `IContains` / `IStartsWith` / `IEndsWith` (Prisma's
+  `mode: "insensitive"`), and `RawCondition`, a dialect-aware raw SQL predicate
+  escape hatch whose `?` placeholders are re-rendered per dialect and whose args
+  are always bound.
+- **Atomic numeric updates** (`update_ops.go`): `Increment`, `Decrement`,
+  `Multiply`, `Divide` and `SetTo` return an `UpdateOp` usable as a value in the
+  `Update`/`UpdateSQL` map, compiling to parameterized `col = col ± ?`
+  assignments (Prisma's `{ increment }`, `{ decrement }`, `{ multiply }`,
+  `{ divide }`, `{ set }`).
+- **Extended JSON path filters** (`json_ext.go`): `JSONNotEquals`, `JSONGt`,
+  `JSONGte`, `JSONLt`, `JSONLte`, `JSONContains` / `JSONNotContains`,
+  `JSONStartsWith`, `JSONEndsWith`, and `JSONIsNull` / `JSONIsNotNull`,
+  mirroring Prisma's JSON `not`/`gt`/`lt`/`string_contains`/`string_starts_with`
+  filters, with dialect-adaptive extraction.
+- **Query methods** (`query_ext.go`, `builder_ext.go`): `FindFirstOrThrow` /
+  `FindUniqueOrThrow` (typed P2025 on miss), `Exists` / `ExistsSQL`,
+  `CountDistinct` / `CountDistinctSQL`, `Paginate(page, size)` offset
+  pagination, `Clone` for reusable query bases, and the `WhereRaw` / `OrWhere`
+  predicate conveniences.
+
 ## [0.2.0] - 2026-07-17
 
 Large feature release moving toward Prisma parity. Still pure Go standard

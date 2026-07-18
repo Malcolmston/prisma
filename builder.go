@@ -405,7 +405,11 @@ func (q *Query[T]) UpdateSQL(data map[string]any) (string, []any, error) {
 	b.WriteString(" SET ")
 	sets := make([]string, len(cols))
 	for i, c := range cols {
-		sets[i] = c + " = " + w.bind(data[c])
+		if ue, ok := data[c].(updateExpr); ok {
+			sets[i] = ue.compileUpdate(c, w)
+		} else {
+			sets[i] = c + " = " + w.bind(data[c])
+		}
 	}
 	b.WriteString(strings.Join(sets, ", "))
 	b.WriteString(q.whereClause(w))
